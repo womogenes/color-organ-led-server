@@ -1,0 +1,160 @@
+/*
+ * SPDX-FileCopyrightText: 2010-2022 Espressif Systems (Shanghai) CO LTD
+ *
+ * SPDX-License-Identifier: CC0-1.0
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/ledc.h"
+#include "esp_err.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_eth.h"
+#include "protocol_examples_common.h"
+#include "esp_http_server.h"
+
+#define RED_PIN 21
+#define GREEN_PIN 22
+#define BLUE_PIN 23
+
+#define LEDC_MODE LEDC_LOW_SPEED_MODE
+#define LEDC_DUTY_RES LEDC_TIMER_13_BIT
+#define LEDC_FREQUENCY 4000
+#define MAX_DUTY (1 << LEDC_DUTY_RES) - 1
+
+static uint32_t gamma_table[256];
+
+static void init_gamma_table(void)
+{
+  for (int i = 0; i < 256; i++) {
+    float normalized = i / 255.0f;
+    gamma_table[i] = (uint32_t)(powf(normalized, 2.2f) * MAX_DUTY);
+  }
+}
+
+static inline void set_rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+  ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_0, gamma_table[r]);
+  ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_0);
+  ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_1, gamma_table[g]);
+  ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_1);
+  ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_2, gamma_table[b]);
+  ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_2);
+}
+
+static const struct {
+  uint8_t pin;
+  ledc_channel_t channel;
+} led_config[] = {
+  {RED_PIN, LEDC_CHANNEL_0},
+  {GREEN_PIN, LEDC_CHANNEL_1},
+  {BLUE_PIN, LEDC_CHANNEL_2}
+};
+
+static void pwm_init(void)
+{
+  ledc_timer_config_t timer_config = {
+    .speed_mode = LEDC_MODE,
+    .duty_resolution = LEDC_DUTY_RES,
+    .timer_num = LEDC_TIMER_0,
+    .freq_hz = LEDC_FREQUENCY,
+    .clk_cfg = LEDC_AUTO_CLK
+  };
+  ESP_ERROR_CHECK(ledc_timer_config(&timer_config));
+
+  for (int i = 0; i < 3; i++) {
+    ledc_channel_config_t channel_config = {
+      .speed_mode = LEDC_MODE,
+      .channel = led_config[i].channel,
+      .timer_sel = LEDC_TIMER_0,
+      .intr_type = LEDC_INTR_DISABLE,
+      .gpio_num = led_config[i].pin,
+      .duty = 0,
+      .hpoint = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&channel_config));
+  }
+}
+
+static const char *TAG = "color_organ";
+
+static esp_err_t ws_handler(httpd_req_t *req)
+{
+  if (req->method == HTTP_GET) {
+    return ESP_OK;
+  }
+  
+  httpd_ws_frame_t ws_pkt;
+  memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+  
+  esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
+  if (ret != ESP_OK || ws_pkt.len != 3) {
+    return ESP_OK;
+  }
+  
+  uint8_t rgb[3];
+  ws_pkt.payload = rgb;
+  ret = httpd_ws_recv_frame(req, &ws_pkt, 3);
+  if (ret == ESP_OK && ws_pkt.len == 3) {
+    set_rgb(rgb[0], rgb[1], rgb[2]);
+  }
+  
+  return ESP_OK;
+}
+
+static const httpd_uri_t ws_uri = {
+  .uri = "/ws",
+  .method = HTTP_GET,
+  .handler = ws_handler,
+  .user_ctx = NULL,
+  .is_websocket = true
+};
+
+static httpd_handle_t start_webserver(void)
+{
+  httpd_handle_t server = NULL;
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  
+  if (httpd_start(&server, &config) == ESP_OK) {
+    httpd_register_uri_handler(server, &ws_uri);
+    return server;
+  }
+  return NULL;
+}
+
+void app_main(void)
+{
+  ESP_LOGI(TAG, "Starting Color Organ");
+  
+  ESP_ERROR_CHECK(nvs_flash_init());
+  ESP_ERROR_CHECK(esp_netif_init());
+  ESP_ERROR_CHECK(esp_event_loop_create_default());
+  
+  ESP_LOGI(TAG, "Connecting to network...");
+  ESP_ERROR_CHECK(example_connect());
+  ESP_LOGI(TAG, "Network connected");
+  
+  init_gamma_table();
+  pwm_init();
+  ESP_LOGI(TAG, "PWM initialized");
+  
+  set_rgb(128, 128, 128);
+  ESP_LOGI(TAG, "Set default 50%% brightness");
+  
+  httpd_handle_t server = start_webserver();
+  if (server) {
+    ESP_LOGI(TAG, "WebSocket server started");
+  }
+  
+  while (1) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
