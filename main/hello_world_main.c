@@ -9,6 +9,7 @@
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/ledc.h"
 #include "esp_err.h"
 #include "esp_wifi.h"
@@ -20,6 +21,7 @@
 #include "esp_eth.h"
 #include "protocol_examples_common.h"
 #include "esp_http_server.h"
+#include "esp_timer.h"
 
 #define RED_PIN 21
 #define GREEN_PIN 22
@@ -31,6 +33,9 @@
 #define MAX_DUTY (1 << LEDC_DUTY_RES) - 1
 
 static uint32_t gamma_table[256];
+static volatile bool ws_connected = false;
+static SemaphoreHandle_t rgb_mutex;
+static uint8_t current_rgb[3] = {128, 128, 128};
 
 static void init_gamma_table(void)
 {
@@ -48,6 +53,39 @@ static inline void set_rgb(uint8_t r, uint8_t g, uint8_t b)
   ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_1);
   ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_2, gamma_table[b]);
   ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_2);
+}
+
+static void update_leds_safe(uint8_t r, uint8_t g, uint8_t b)
+{
+  if (xSemaphoreTake(rgb_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    current_rgb[0] = r;
+    current_rgb[1] = g;
+    current_rgb[2] = b;
+    set_rgb(r, g, b);
+    xSemaphoreGive(rgb_mutex);
+  }
+}
+
+static void sine_animation_task(void *pvParameters)
+{
+  const float periods[3] = {0.5f, 1.0f, 2.0f};
+  
+  while (1) {
+    if (!ws_connected) {
+      uint64_t time_us = esp_timer_get_time();
+      float time_s = time_us / 1000000.0f;
+      
+      uint8_t rgb[3];
+      for (int i = 0; i < 3; i++) {
+        float phase = 2.0f * M_PI * time_s / periods[i];
+        float sine_val = (sinf(phase) + 1.0f) * 0.5f;
+        rgb[i] = (uint8_t)(sine_val * 255.0f);
+      }
+      
+      update_leds_safe(rgb[0], rgb[1], rgb[2]);
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
 }
 
 static const struct {
@@ -89,14 +127,26 @@ static const char *TAG = "color_organ";
 static esp_err_t ws_handler(httpd_req_t *req)
 {
   if (req->method == HTTP_GET) {
+    ws_connected = true;
     return ESP_OK;
   }
   
   httpd_ws_frame_t ws_pkt;
   memset(&ws_pkt, 0, sizeof(httpd_ws_frame_t));
+  ws_pkt.type = HTTPD_WS_TYPE_TEXT;
   
   esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, 0);
-  if (ret != ESP_OK || ws_pkt.len != 3) {
+  if (ret != ESP_OK) {
+    ws_connected = false;
+    return ESP_OK;
+  }
+  
+  if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
+    ws_connected = false;
+    return ESP_OK;
+  }
+  
+  if (ws_pkt.len != 3) {
     return ESP_OK;
   }
   
@@ -104,7 +154,14 @@ static esp_err_t ws_handler(httpd_req_t *req)
   ws_pkt.payload = rgb;
   ret = httpd_ws_recv_frame(req, &ws_pkt, 3);
   if (ret == ESP_OK && ws_pkt.len == 3) {
-    set_rgb(rgb[0], rgb[1], rgb[2]);
+    ws_connected = true;
+    if (rgb[0] == 255 && rgb[1] == 255 && rgb[2] == 255) {
+      httpd_ws_send_frame(req, &ws_pkt);
+    } else {
+      update_leds_safe(rgb[0], rgb[1], rgb[2]);
+    }
+  } else {
+    ws_connected = false;
   }
   
   return ESP_OK;
@@ -134,6 +191,12 @@ void app_main(void)
 {
   ESP_LOGI(TAG, "Starting Color Organ");
   
+  rgb_mutex = xSemaphoreCreateMutex();
+  if (rgb_mutex == NULL) {
+    ESP_LOGE(TAG, "Failed to create RGB mutex");
+    return;
+  }
+  
   ESP_ERROR_CHECK(nvs_flash_init());
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -148,6 +211,9 @@ void app_main(void)
   
   set_rgb(128, 128, 128);
   ESP_LOGI(TAG, "Set default 50%% brightness");
+  
+  xTaskCreate(sine_animation_task, "sine_anim", 4096, NULL, 5, NULL);
+  ESP_LOGI(TAG, "Sine animation task started");
   
   httpd_handle_t server = start_webserver();
   if (server) {
