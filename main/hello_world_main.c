@@ -22,6 +22,7 @@
 #include "protocol_examples_common.h"
 #include "esp_http_server.h"
 #include "esp_timer.h"
+#include "esp_http_client.h"
 
 #define RED_PIN 21
 #define GREEN_PIN 22
@@ -124,6 +125,49 @@ static void pwm_init(void)
 
 static const char *TAG = "color_organ";
 
+static void send_ip_to_server(void)
+{
+  esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (netif == NULL) {
+    ESP_LOGE(TAG, "Failed to get network interface");
+    return;
+  }
+  
+  esp_netif_ip_info_t ip_info;
+  if (esp_netif_get_ip_info(netif, &ip_info) != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to get IP info");
+    return;
+  }
+  
+  char ip_str[16];
+  sprintf(ip_str, IPSTR, IP2STR(&ip_info.ip));
+  ESP_LOGI(TAG, "Local IP: %s", ip_str);
+  
+  esp_http_client_config_t config = {
+    .url = "http://kv.wfeng.dev/esp:ip",
+    .method = HTTP_METHOD_POST,
+  };
+  
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (client == NULL) {
+    ESP_LOGE(TAG, "Failed to initialize HTTP client");
+    return;
+  }
+  
+  esp_http_client_set_header(client, "Content-Type", "text/plain");
+  esp_http_client_set_post_field(client, ip_str, strlen(ip_str));
+  
+  esp_err_t err = esp_http_client_perform(client);
+  if (err == ESP_OK) {
+    int status_code = esp_http_client_get_status_code(client);
+    ESP_LOGI(TAG, "IP sent to server, status: %d", status_code);
+  } else {
+    ESP_LOGE(TAG, "HTTP POST failed: %s", esp_err_to_name(err));
+  }
+  
+  esp_http_client_cleanup(client);
+}
+
 static esp_err_t ws_handler(httpd_req_t *req)
 {
   if (req->method == HTTP_GET) {
@@ -211,6 +255,8 @@ void app_main(void)
   
   set_rgb(128, 128, 128);
   ESP_LOGI(TAG, "Set default 50%% brightness");
+  
+  send_ip_to_server();
   
   xTaskCreate(sine_animation_task, "sine_anim", 4096, NULL, 5, NULL);
   ESP_LOGI(TAG, "Sine animation task started");
