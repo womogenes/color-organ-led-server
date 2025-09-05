@@ -24,9 +24,9 @@
 #include "esp_timer.h"
 #include "esp_http_client.h"
 
-#define RED_PIN 21
-#define GREEN_PIN 22
-#define BLUE_PIN 23
+#define RED_PIN 26
+#define GREEN_PIN 27
+#define BLUE_PIN 14
 
 #define LEDC_MODE LEDC_LOW_SPEED_MODE
 #define LEDC_DUTY_RES LEDC_TIMER_13_BIT
@@ -78,7 +78,7 @@ static void sine_animation_task(void *pvParameters)
       
       uint8_t rgb[3];
       for (int i = 0; i < 3; i++) {
-        float phase = 2.0f * M_PI * time_s / periods[i];
+        float phase = 0.25f * M_PI * time_s / periods[i];
         float sine_val = (sinf(phase) + 1.0f) * 0.5f;
         rgb[i] = (uint8_t)(sine_val * 255.0f);
       }
@@ -241,6 +241,13 @@ void app_main(void)
     return;
   }
   
+  init_gamma_table();
+  pwm_init();
+  ESP_LOGI(TAG, "PWM initialized");
+  
+  set_rgb(0, 0, 0);
+  ESP_LOGI(TAG, "Set all pins to zero on boot");
+  
   ESP_ERROR_CHECK(nvs_flash_init());
   ESP_ERROR_CHECK(esp_netif_init());
   ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -248,13 +255,6 @@ void app_main(void)
   ESP_LOGI(TAG, "Connecting to network...");
   ESP_ERROR_CHECK(example_connect());
   ESP_LOGI(TAG, "Network connected");
-  
-  init_gamma_table();
-  pwm_init();
-  ESP_LOGI(TAG, "PWM initialized");
-  
-  set_rgb(128, 128, 128);
-  ESP_LOGI(TAG, "Set default 50%% brightness");
   
   send_ip_to_server();
   
